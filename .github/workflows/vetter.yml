@@ -1,0 +1,279 @@
+name: Vetter Validation
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: read
+
+env:
+  # Mirrors upstream e2e.yml — anything missing shows up as false positive.
+  DATABASE_URL: postgresql://postgres:postgres@localhost:5432/calendso
+  DATABASE_DIRECT_URL: postgresql://postgres:postgres@localhost:5432/calendso
+  NEXTAUTH_SECRET: secret
+  NEXTAUTH_URL: http://localhost:3000
+  NEXT_PUBLIC_WEBAPP_URL: http://localhost:3000
+  NEXT_PUBLIC_WEBSITE_URL: http://localhost:3000
+  NEXT_PUBLIC_API_V2_URL: http://localhost:3002/api/v2
+  NEXT_PUBLIC_API_V2_ROOT_URL: http://localhost:3002
+  CALENDSO_ENCRYPTION_KEY: 79ADDC8C05FAE3A27E3A3DE9EED39
+  NODE_OPTIONS: --max-old-space-size=4096
+  E2E_TEST_MAILHOG_ENABLED: "1"
+  EMAIL_SERVER_HOST: localhost
+  EMAIL_SERVER_PORT: "1025"
+  EMAIL_SERVER_USER: ""
+  EMAIL_SERVER_PASSWORD: ""
+  NEXT_PUBLIC_IS_E2E: "1"
+  ALLOWED_HOSTNAMES: '"localhost:3000","localhost"'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: calendso
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+          --health-start-period 2s
+        ports:
+          - 5432:5432
+      mailhog:
+        image: mailhog/mailhog:v1.0.1
+        ports:
+          - 8025:8025
+          - 1025:1025
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Collect PR context
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          git diff "$BASE_SHA..$HEAD_SHA" > /tmp/pr.diff
+          gh pr view "$PR_NUMBER" --json title,body -q '.title + "\n\n" + (.body // "")' > /tmp/pr.summary
+          ticket_issue=$(grep -iEo '(fixes|closes|resolves) #[0-9]+' /tmp/pr.summary | head -1 | grep -Eo '[0-9]+' || true)
+          if [ -n "$ticket_issue" ]; then
+            gh issue view "$ticket_issue" --json title,body -q '.title + "\n\n" + (.body // "")' > /tmp/pr.ticket
+          else
+            cp /tmp/pr.summary /tmp/pr.ticket
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: yarn
+
+      - name: Install dependencies
+        env:
+          YARN_ENABLE_IMMUTABLE_INSTALLS: "false"
+          YARN_NM_MODE: hardlinks-local
+          HUSKY: "0"
+        run: yarn install
+
+      - name: Prisma generate
+        run: yarn prisma generate
+
+      - name: Apply migrations + seed
+        run: |
+          yarn db-deploy
+          yarn db-seed
+
+      - name: Start app (dev mode)
+        run: |
+          # `yarn build` OOMs on ubuntu-latest building @calcom/atoms; dev mode
+          # compiles on demand which is fine for behavioural validation.
+          nohup yarn dev >/tmp/app.log 2>&1 &
+          echo "APP_PID=$!" >> "$GITHUB_ENV"
+
+      - name: Wait for app
+        uses: iFaxity/wait-on-action@v1
+        with:
+          resource: http://localhost:3000
+          timeout: 180000
+          interval: 2000
+
+      # ── Vetter: daemon + tunnel + register ──────────────────────────
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Build + start valid daemon
+        env:
+          # Keep chromium under valid-mcp/node_modules so the MCP server picks
+          # it up without a separate install path.
+          PLAYWRIGHT_BROWSERS_PATH: "0"
+        run: |
+          set -euo pipefail
+          # Daemon token is per-run; vetter only needs it for this validation.
+          DAEMON_TOKEN=$(openssl rand -hex 16)
+          echo "DAEMON_TOKEN=$DAEMON_TOKEN" >> "$GITHUB_ENV"
+          git clone --depth 1 https://github.com/nithinkrishnamurthi/valid /tmp/valid
+          (cd /tmp/valid/daemon && go build -o /tmp/daemon .)
+          # valid-mcp isn't on npm — build from source.
+          (cd /tmp/valid/valid-mcp && npm ci && npm run build)
+          cat >/tmp/daemon-mcp.json <<EOF
+          {"mcpServers":{"valid":{"command":"node","args":["/tmp/valid/valid-mcp/dist/index.js"]}}}
+          EOF
+          DAEMON_TOKEN="$DAEMON_TOKEN" nohup /tmp/daemon \
+            --port 9090 --mcp-config /tmp/daemon-mcp.json \
+            > /tmp/daemon.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -fsS http://localhost:9090/health >/dev/null 2>&1 && break
+            sleep 1
+          done
+          curl -fsS http://localhost:9090/health
+
+      - name: Open cloudflared tunnel
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /usr/local/bin/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x /usr/local/bin/cloudflared
+          nohup cloudflared tunnel --no-autoupdate --url http://localhost:9090 \
+            > /tmp/cloudflared.log 2>&1 &
+          for i in $(seq 1 30); do
+            url=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1 || true)
+            if [ -n "$url" ]; then
+              # GITHUB_ENV propagates to later steps; export also exposes it
+              # to the same-step check below.
+              echo "TUNNEL_URL=$url" >> "$GITHUB_ENV"
+              export TUNNEL_URL="$url"
+              echo "tunnel: $url"; break
+            fi
+            sleep 2
+          done
+          [ -n "${TUNNEL_URL:-}" ] || { echo "tunnel never opened" >&2; cat /tmp/cloudflared.log >&2; exit 1; }
+
+      - name: Create vetter env
+        env:
+          VETTER_API_KEY: ${{ secrets.VETTER_API_KEY }}
+        run: |
+          set -euo pipefail
+          resp=$(curl -fsSL -X POST "https://api.getvetter.dev/environments" \
+            -H "Authorization: Bearer ${VETTER_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d '{"mode":"external"}')
+          env_id=$(echo "$resp" | jq -r .id)
+          [ -n "$env_id" ] && [ "$env_id" != "null" ] || { echo "no env id: $resp" >&2; exit 1; }
+          echo "VETTER_ENV_ID=$env_id" >> "$GITHUB_ENV"
+          echo "created vetter env: $env_id"
+
+      - name: Register daemon with vetter
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          name="ci-${{ github.repository_owner }}-${{ github.event.repository.name }}-pr${PR_NUMBER}-${{ github.run_id }}"
+          echo "DAEMON_NAME=$name" >> "$GITHUB_ENV"
+          curl -fsSL -X POST "https://api.getvetter.dev/register" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg env "$VETTER_ENV_ID" --arg name "$name" --arg addr "$TUNNEL_URL" --arg tok "$DAEMON_TOKEN" \
+                  '{env_id:$env, name:$name, address:$addr, token:$tok, description:"CI runner"}')"
+
+      - name: Kick off vetter run
+        id: vet
+        env:
+          VETTER_API_KEY: ${{ secrets.VETTER_API_KEY }}
+        run: |
+          set -euo pipefail
+          jq -n \
+            --rawfile ticket  /tmp/pr.ticket \
+            --rawfile summary /tmp/pr.summary \
+            --rawfile diff    /tmp/pr.diff \
+            '{ticket:$ticket, summary:$summary, diff:$diff}' > /tmp/vetter-payload.json
+          resp=$(curl -fsSL -X POST \
+            "https://api.getvetter.dev/environments/${VETTER_ENV_ID}/validate" \
+            -H "Authorization: Bearer ${VETTER_API_KEY}" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/vetter-payload.json)
+          run_id=$(echo "$resp" | jq -r .run_id)
+          [ -n "$run_id" ] && [ "$run_id" != "null" ] || { echo "no run_id: $resp" >&2; exit 1; }
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+
+      - name: Poll for verdict
+        env:
+          VETTER_API_KEY: ${{ secrets.VETTER_API_KEY }}
+          RUN_ID: ${{ steps.vet.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 120); do
+            resp=$(curl -fsSL \
+              "https://api.getvetter.dev/environments/${VETTER_ENV_ID}/runs/${RUN_ID}" \
+              -H "Authorization: Bearer ${VETTER_API_KEY}")
+            status=$(echo "$resp" | jq -r .status)
+            echo "[$i] status=$status"
+            if [ "$status" = "completed" ]; then
+              echo "$resp" > "$GITHUB_WORKSPACE/verdict.json"
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "timed out" >&2; exit 1
+
+      - name: Teardown vetter env
+        if: always() && env.VETTER_ENV_ID != ''
+        env:
+          VETTER_API_KEY: ${{ secrets.VETTER_API_KEY }}
+        run: |
+          # Deregister daemon (if registered), then delete the env.
+          if [ -n "${DAEMON_NAME:-}" ]; then
+            curl -fsSL -X DELETE "https://api.getvetter.dev/register" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n --arg env "$VETTER_ENV_ID" --arg name "$DAEMON_NAME" \
+                    '{env_id:$env, name:$name}')" || true
+          fi
+          curl -fsSL -X DELETE "https://api.getvetter.dev/environments/${VETTER_ENV_ID}" \
+            -H "Authorization: Bearer ${VETTER_API_KEY}" || true
+
+      - name: Post PR comment
+        if: always() && hashFiles('verdict.json') != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const v = JSON.parse(fs.readFileSync(`${process.env.GITHUB_WORKSPACE}/verdict.json`, 'utf8'));
+            const r = v.result || {};
+            const status = (r.status || 'unknown').toUpperCase();
+            const icon = r.status === 'pass' ? '✅' : r.status === 'fail' ? '❌' : '❓';
+            const reportImg = v.id
+              ? `![report](https://api.getvetter.dev/reports/${v.id})`
+              : '';
+            const body = [
+              `## ${icon} Vetter: ${status}`,
+              '',
+              r.reason || '_no reason provided_',
+              '',
+              reportImg,
+            ].join('\n');
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });
+
+      - name: Logs on failure
+        if: failure()
+        run: |
+          echo "=== app ==="; tail -n 200 /tmp/app.log || true
+          echo "=== daemon ==="; tail -n 200 /tmp/daemon.log || true
+          echo "=== tunnel ==="; tail -n 100 /tmp/cloudflared.log || true
