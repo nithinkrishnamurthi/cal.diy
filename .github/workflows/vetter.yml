@@ -1,0 +1,87 @@
+name: vetter
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: vetter-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      pull-requests: write
+
+    env:
+      APP_PORT: 3000
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: yarn
+
+      - name: Install deps
+        run: yarn install --frozen-lockfile
+
+      - name: Configure env
+        run: |
+          cp .env.example .env
+          # cal.com panics without these — .env.example leaves them blank.
+          python3 -c "import secrets; print(f'NEXTAUTH_SECRET={secrets.token_hex(32)}')" >> .env
+          python3 -c "import secrets; print(f'CALENDSO_ENCRYPTION_KEY={secrets.token_hex(16)}')" >> .env
+
+      - name: Bring up Postgres
+        run: yarn workspace @calcom/prisma db-up
+
+      - name: Wait for Postgres
+        run: |
+          for i in $(seq 1 90); do
+            if docker exec $(docker ps -q --filter "ancestor=postgres:18") pg_isready >/dev/null 2>&1; then
+              echo "postgres ready"; exit 0
+            fi
+            sleep 2
+          done
+          echo "postgres did not become ready in 180s" >&2
+          docker ps -a >&2
+          exit 1
+
+      - name: Migrate database
+        run: yarn workspace @calcom/prisma db-deploy
+
+      - name: Start app
+        run: |
+          nohup yarn dev > app.log 2>&1 &
+          echo "$!" > app.pid
+          for i in $(seq 1 300); do
+            if curl -sf "http://localhost:$APP_PORT" >/dev/null; then
+              echo "app up"; exit 0
+            fi
+            sleep 2
+          done
+          echo "app did not come up" >&2
+          tail -n 200 app.log >&2
+          exit 1
+
+      - uses: nithinkrishnamurthi/vetter/action@main
+        with:
+          api-key: ${{ secrets.VETTER_API_KEY }}
+          api-base: ${{ vars.VETTER_API_BASE }}
+          app-url: http://localhost:3000
+
+      - name: Upload app logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-logs-${{ github.event.pull_request.number }}-${{ github.run_id }}
+          path: |
+            app.log
+          if-no-files-found: ignore
