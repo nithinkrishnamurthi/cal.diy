@@ -27,10 +27,25 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: yarn
+
+      - name: Enable corepack (project pins its own yarn version)
+        run: |
+          corepack enable
+          # If `packageManager` is set in package.json (yarn 3+), prepare it.
+          # Otherwise leave the default (yarn 1) alone.
+          if node -e "process.exit(require('./package.json').packageManager ? 0 : 1)"; then
+            corepack prepare --activate "$(node -p "require('./package.json').packageManager")"
+          fi
+          yarn --version
 
       - name: Install deps
-        run: yarn install --frozen-lockfile
+        # Use whichever flag this yarn version understands. yarn 1: --frozen-lockfile.
+        # yarn 3+: --immutable. Try in order, fall through to plain install if both fail
+        # (older bases sometimes have lockfile drift that needs regen).
+        run: |
+          yarn install --immutable 2>/dev/null \
+            || yarn install --frozen-lockfile 2>/dev/null \
+            || yarn install
 
       - name: Configure env
         run: |
