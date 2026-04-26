@@ -58,8 +58,12 @@ jobs:
 
       - name: Wait for Postgres
         run: |
+          # Older bases pin postgres:13; newer ones use postgres:18. Filter by
+          # the prisma-* container name (set by @calcom/prisma's docker-compose),
+          # which is stable across both.
           for i in $(seq 1 90); do
-            if docker exec $(docker ps -q --filter "ancestor=postgres:18") pg_isready >/dev/null 2>&1; then
+            cid=$(docker ps -q --filter "name=prisma-postgres" --filter "status=running" | head -1)
+            if [ -n "$cid" ] && docker exec "$cid" pg_isready >/dev/null 2>&1; then
               echo "postgres ready"; exit 0
             fi
             sleep 2
